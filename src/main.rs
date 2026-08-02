@@ -1,84 +1,77 @@
-use lightcrazy::lock::{acquire_device_lock, acquire_tray_lock, acquire_ui_lock, tray_is_running};
+use litecrazy::{browser, config, lock::acquire_instance_lock};
 use log::{error, info};
 
+const HELP: &str = "\
+litecrazy — battery tray icon for the Pulsar X2 CrazyLight
+
+USAGE:
+    litecrazy            Run the tray (default)
+    litecrazy --open     Open the web configurator and exit
+    litecrazy --help     Show this message
+    litecrazy --version  Show the version
+
+Device settings are configured at the web configurator, not here.
+
+ENVIRONMENT:
+    LITECRAZY_URL              Configurator URL
+    LITECRAZY_BROWSER          Browser binary; skips auto-detection
+    LITECRAZY_BROWSER_ARGS     Extra flags passed to the browser
+    LITECRAZY_WINDOW_MODE      app (default) or tab
+    LITECRAZY_INTERVAL         Battery poll interval in seconds (10-3600)
+    LITECRAZY_LOW_THRESHOLD    Low-battery notification percent (0 = off)
+    LITECRAZY_PAUSE_MINUTES    Polling pause after opening the configurator
+";
+
 fn main() -> anyhow::Result<()> {
-    let open_ui = std::env::args().any(|a| a == "--options" || a == "-o");
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if open_ui {
-        // In TUI mode, redirect logs to a file so background thread messages
-        // don't bleed through into the raw-mode terminal.
-        init_file_logger();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{HELP}");
+        return Ok(());
+    }
 
-        let _tray_guards = if !tray_is_running() {
-            info!("No tray running — starting tray in background");
-            let lock = acquire_tray_lock()?;
-            let service = lightcrazy::tray::start_tray_background()?;
-            Some((lock, service))
-        } else {
-            info!("Tray already running — attaching TUI");
-            None
-        };
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("litecrazy {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
-        // Signal the tray monitor to skip battery polls while TUI is open.
-        let _ui_lock = acquire_ui_lock()
-            .map_err(|_| anyhow::anyhow!("TUI is already open in another window"))?;
+    init_logger();
 
-        // Wait for any in-progress tray battery poll to finish before opening
-        // the device ourselves. The tray holds the device lock for the duration
-        // of each poll, acquiring it here (blocking) guarantees the protocol
-        // is in a clean state before App::new() touches the device. We release
-        // it immediately, the UI lock above prevents the tray from starting
-        // any new polls, so the device is ours for the TUI session.
-        {
-            let _settle = acquire_device_lock()
-                .map_err(|e| anyhow::anyhow!("Could not acquire device lock: {}", e))?;
-            info!("Device lock acquired and released — device is in a clean state");
-        }
+    if args.iter().any(|a| a == "--open" || a == "-o") {
+        info!("Opening configurator at {}", config::configurator_url());
+        browser::open_configurator();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        return Ok(());
+    }
 
-        if let Err(e) = lightcrazy::ui::run() {
-            error!("TUI error: {}", e);
-        }
-    } else {
-        env_logger::builder()
-            .filter_level(log::LevelFilter::Info)
-            .format_timestamp(Some(env_logger::TimestampPrecision::Seconds))
-            .init();
+    if let Some(unknown) = args
+        .iter()
+        .find(|a| a.starts_with('-') && a.as_str() != "--")
+    {
+        eprintln!("litecrazy: unrecognised option '{unknown}'\n");
+        eprint!("{HELP}");
+        std::process::exit(2);
+    }
 
-        info!("Starting lightcrazy tray");
+    let _lock = acquire_instance_lock().map_err(|_| {
+        anyhow::anyhow!(
+            "litecrazy is already running.\n\
+             Use --open to open the configurator in a browser."
+        )
+    })?;
 
-        let _lock = acquire_tray_lock().map_err(|_| {
-            anyhow::anyhow!(
-                "Tray is already running.\nUse --options / -o to open the settings panel."
-            )
-        })?;
-
-        if let Err(e) = lightcrazy::tray::start_tray_service() {
-            error!("Tray service error: {}", e);
-            std::process::exit(1);
-        }
+    if let Err(e) = litecrazy::tray::run() {
+        error!("Tray service error: {e}");
+        std::process::exit(1);
     }
 
     Ok(())
 }
 
-fn init_file_logger() {
-    use std::fs::OpenOptions;
-
-    let log_path = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|d| std::path::PathBuf::from(d).join("lightcrazy.log"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/lightcrazy.log"));
-
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Info)
-            .format_timestamp(Some(env_logger::TimestampPrecision::Seconds))
-            .target(env_logger::Target::Pipe(Box::new(file)))
-            .init();
-
-        info!("TUI mode — logging to {}", log_path.display());
-    } else {
-        env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Error)
-            .init();
-    }
+fn init_logger() {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp(Some(env_logger::TimestampPrecision::Seconds))
+        .parse_default_env()
+        .init();
 }

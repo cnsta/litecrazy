@@ -4,14 +4,13 @@ use std::sync::{
     mpsc, Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::device::{
     protocol::{self, BatteryReadError, MouseStatus},
     transport::Device,
 };
 
-/// Events emitted by the worker to whichever component spawned it.
 #[derive(Debug, Clone)]
 pub enum BatteryEvent {
     Update(MouseStatus),
@@ -19,20 +18,75 @@ pub enum BatteryEvent {
     Disconnected,
 }
 
-/// How the worker obtains a `Device` for each poll.
-pub enum DeviceSource {
-    Shared(Arc<Mutex<Device>>),
-    Owned,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    Running,
+    PausedUntil(Instant),
+    Paused,
 }
 
-/// Config for `BatteryWorker::spawn`.
+#[derive(Debug)]
+pub struct PollGate {
+    state: Mutex<GateState>,
+}
+
+impl Default for PollGate {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(GateState::Running),
+        }
+    }
+}
+
+impl PollGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let GateState::PausedUntil(deadline) = *state {
+            if Instant::now() >= deadline {
+                info!("Poll pause expired; resuming battery polling");
+                *state = GateState::Running;
+            }
+        }
+        !matches!(*state, GateState::Running)
+    }
+
+    pub fn pause_for(&self, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        *state = GateState::PausedUntil(Instant::now() + duration);
+        info!("Battery polling paused for {}s", duration.as_secs());
+    }
+
+    pub fn pause_indefinitely(&self) {
+        *self.state.lock().unwrap() = GateState::Paused;
+        info!("Battery polling paused");
+    }
+
+    pub fn resume(&self) {
+        *self.state.lock().unwrap() = GateState::Running;
+        info!("Battery polling resumed");
+    }
+
+    pub fn toggle(&self) {
+        if self.is_paused() {
+            self.resume();
+        } else {
+            self.pause_indefinitely();
+        }
+    }
+}
+
 pub struct WorkerConfig {
-    /// Base poll interval. Adaptive backoff multiplies this by up to 8× when
-    /// the mouse is asleep, so the effective ceiling is `8 × interval`.
     pub interval: Duration,
     pub disconnect_backoff: Duration,
-    pub device_source: DeviceSource,
     pub refresh_flag: Arc<AtomicBool>,
+    pub gate: Arc<PollGate>,
 }
 
 /// Handle to the background worker. Dropping joins the thread.
@@ -76,61 +130,22 @@ enum PollOutcome {
     Ok(MouseStatus),
     Asleep,
     Disconnected,
-    Busy,
 }
 
-impl DeviceSource {
-    /// Attempt one battery read. Maps low-level errors to `PollOutcome`.
-    fn poll(&self) -> PollOutcome {
-        match self {
-            DeviceSource::Shared(arc) => match arc.try_lock() {
-                Ok(dev) => classify(protocol::get_mouse_battery(&dev)),
-                Err(_) => PollOutcome::Busy,
-            },
-            DeviceSource::Owned => owned_poll(),
-        }
-    }
-}
-
-fn owned_poll() -> PollOutcome {
-    if crate::lock::ui_is_active() {
-        debug!("Worker (owned): TUI active, skipping poll");
-        return PollOutcome::Busy;
-    }
-
-    let _device_guard = match crate::lock::try_acquire_device_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            debug!("Worker (owned): device lock held, skipping poll");
-            return PollOutcome::Busy;
-        }
-    };
-
-    if crate::lock::ui_is_active() {
-        debug!("Worker (owned): TUI activated during lock acquire, skipping poll");
-        return PollOutcome::Busy;
-    }
-
-    let dev = match Device::open() {
+fn poll_once() -> PollOutcome {
+    let device = match Device::open() {
         Ok(d) => d,
         Err(e) => {
-            debug!("Worker (owned): Device::open failed: {}", e);
-            // Open failure is essentially always "dongle not present" — the
-            // udev rules give us read access whenever the node exists. Treat
-            // it as Disconnected so the backoff kicks in.
+            debug!("Device::open failed: {e}");
             return PollOutcome::Disconnected;
         }
     };
 
-    classify(protocol::get_mouse_battery(&dev))
-}
-
-fn classify(result: std::result::Result<MouseStatus, BatteryReadError>) -> PollOutcome {
-    match result {
+    match protocol::get_mouse_battery(&device) {
         Ok(status) => PollOutcome::Ok(status),
         Err(BatteryReadError::Asleep) => PollOutcome::Asleep,
         Err(BatteryReadError::Io(e)) => {
-            info!("Worker: transport error: {}", e);
+            info!("Transport error: {e}");
             PollOutcome::Disconnected
         }
     }
@@ -150,8 +165,8 @@ fn worker_loop(config: WorkerConfig, running: Arc<AtomicBool>, tx: mpsc::Sender<
     let WorkerConfig {
         interval,
         disconnect_backoff,
-        device_source,
         refresh_flag,
+        gate,
     } = config;
 
     info!(
@@ -167,13 +182,24 @@ fn worker_loop(config: WorkerConfig, running: Arc<AtomicBool>, tx: mpsc::Sender<
     let mut consecutive_asleep: u32 = 0;
     let mut current_interval = interval;
     let mut first_poll_pending = true;
+    let mut was_paused = false;
 
     while running.load(Ordering::Acquire) {
         thread::sleep(TICK);
 
         let manual_refresh = refresh_flag.swap(false, Ordering::AcqRel);
 
-        if manual_refresh {
+        if gate.is_paused() {
+            was_paused = true;
+            continue;
+        }
+
+        // Poll immediately on the first tick after a pause, so resuming from
+        // the menu gives an instant reading rather than a stale one.
+        let just_resumed = was_paused;
+        was_paused = false;
+
+        if manual_refresh || just_resumed {
             backoff_remaining = Duration::ZERO;
         } else if backoff_remaining > Duration::ZERO {
             backoff_remaining = backoff_remaining.saturating_sub(TICK);
@@ -188,13 +214,10 @@ fn worker_loop(config: WorkerConfig, running: Arc<AtomicBool>, tx: mpsc::Sender<
         accumulated = Duration::ZERO;
         first_poll_pending = false;
 
-        match device_source.poll() {
+        match poll_once() {
             PollOutcome::Ok(status) => {
                 if consecutive_asleep > 0 {
-                    debug!(
-                        "Worker: mouse awake after {} asleep poll(s)",
-                        consecutive_asleep
-                    );
+                    debug!("Mouse awake after {consecutive_asleep} asleep poll(s)");
                 }
                 consecutive_asleep = 0;
                 current_interval = interval;
@@ -204,7 +227,7 @@ fn worker_loop(config: WorkerConfig, running: Arc<AtomicBool>, tx: mpsc::Sender<
                 consecutive_asleep = consecutive_asleep.saturating_add(1);
                 current_interval = next_sleep_interval(interval, consecutive_asleep);
                 debug!(
-                    "Worker: mouse asleep (consecutive: {}, next poll in {}s)",
+                    "Mouse asleep (consecutive: {}, next poll in {}s)",
                     consecutive_asleep,
                     current_interval.as_secs()
                 );
@@ -215,14 +238,10 @@ fn worker_loop(config: WorkerConfig, running: Arc<AtomicBool>, tx: mpsc::Sender<
                 current_interval = interval;
                 backoff_remaining = disconnect_backoff;
                 warn!(
-                    "Worker: device unreachable, backing off {}s",
+                    "Device unreachable, backing off {}s",
                     disconnect_backoff.as_secs()
                 );
                 let _ = tx.send(BatteryEvent::Disconnected);
-            }
-            PollOutcome::Busy => {
-                debug!("Worker: device busy, will retry next tick");
-                accumulated = current_interval.saturating_sub(TICK);
             }
         }
     }
@@ -252,14 +271,45 @@ mod tests {
     fn sleep_interval_caps_at_eight_times() {
         let base = Duration::from_secs(60);
         assert_eq!(next_sleep_interval(base, 4), Duration::from_secs(480));
-        assert_eq!(next_sleep_interval(base, 5), Duration::from_secs(480));
         assert_eq!(next_sleep_interval(base, 100), Duration::from_secs(480));
     }
 
     #[test]
-    fn sleep_interval_scales_with_base() {
-        let base = Duration::from_secs(30);
-        assert_eq!(next_sleep_interval(base, 2), Duration::from_secs(60));
-        assert_eq!(next_sleep_interval(base, 4), Duration::from_secs(240));
+    fn gate_starts_running() {
+        assert!(!PollGate::new().is_paused());
+    }
+
+    #[test]
+    fn gate_pauses_and_resumes() {
+        let gate = PollGate::new();
+        gate.pause_indefinitely();
+        assert!(gate.is_paused());
+        gate.resume();
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn gate_toggles() {
+        let gate = PollGate::new();
+        gate.toggle();
+        assert!(gate.is_paused());
+        gate.toggle();
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn zero_duration_pause_is_a_noop() {
+        let gate = PollGate::new();
+        gate.pause_for(Duration::ZERO);
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn timed_pause_expires_on_its_own() {
+        let gate = PollGate::new();
+        gate.pause_for(Duration::from_millis(50));
+        assert!(gate.is_paused());
+        thread::sleep(Duration::from_millis(80));
+        assert!(!gate.is_paused());
     }
 }

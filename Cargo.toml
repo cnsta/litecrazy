@@ -1,13 +1,13 @@
 [package]
-name = "lightcrazy"
-version = "0.3.1"
+name = "litecrazy"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 authors = ["cnst <mail@cnst.dev>"]
-description = "Control software for the Pulsar X2 CrazyLight mouse"
-repository = "https://github.com/cnsta/lightcrazy"
+description = "Battery tray icon for the Pulsar X2 CrazyLight, with a shortcut to the web configurator"
+repository = "https://github.com/cnsta/litecrazy"
 readme = "README.md"
-keywords = ["mouse", "pulsar", "hid", "tray", "lightcrazy"]
+keywords = ["mouse", "pulsar", "hid", "tray", "battery"]
 categories = ["hardware-support"]
 
 [dependencies]
@@ -19,33 +19,20 @@ env_logger = "0.11"
 # USB/HID
 hidapi = "2.6"
 
-# TUI
-ratatui = "0.30"
-crossterm = "0.29"
-throbber-widgets-tui = "0.10"
-tui-slider = "0.3"
-tui-big-text = "0.8"
-
 # Tray
 ksni = { version = "0.3", features = ["blocking"] }
 zbus = { version = "5", features = ["blocking"] }
 notify-rust = { version = "4.11", default-features = false, features = ["d"] }
 ctrlc = "3.5"
 
-# Configuration
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-dirs = "6.0"
-shellexpand = "3.1"
-
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["fs", "poll", "user"] }
+nix = { version = "0.31", features = ["fs", "user"] }
 
 [build-dependencies]
 resvg = "0.47"
 
 [lib]
-name = "lightcrazy"
+name = "litecrazy"
 path = "src/lib.rs"
 
 [profile.release]

@@ -18,15 +18,6 @@ impl NotificationState {
         }
     }
 
-    // Returns true if a low-battery notification should be sent now.
-    //
-    // Conditions (all must hold):
-    // * Not currently charging.
-    // * Level is at or below the configured threshold.
-    // * Level has dropped since the last reading (avoids re-alerting
-    //   at the same level across consecutive polls).
-    // * No notification has been sent within the last 5 minutes
-    //   (prevents spam if the mouse sits at threshold for a long time).
     pub fn should_notify_low_battery(
         &self,
         current_level: u8,
@@ -34,6 +25,10 @@ impl NotificationState {
         threshold: u8,
         is_charging: bool,
     ) -> bool {
+        if threshold == 0 {
+            return false;
+        }
+
         if is_charging || current_level > threshold || current_level >= previous_level {
             return false;
         }
@@ -47,7 +42,7 @@ impl NotificationState {
     pub fn send_low_battery(&mut self, level: u8) -> anyhow::Result<()> {
         Notification::new()
             .summary("Low Battery")
-            .body(&format!("Pulsar X2 battery at {}%", level))
+            .body(&format!("Pulsar X2 CrazyLight battery at {}%", level))
             .icon("battery-caution-symbolic")
             .urgency(Urgency::Critical)
             .timeout(0) // persistent until dismissed — battery needs attention
@@ -132,6 +127,14 @@ mod tests {
         // A genuine drop below threshold that *would* notify if the cooldown
         // weren't active.
         assert!(!s.should_notify_low_battery(10, 15, 20, false));
+    }
+
+    /// A threshold of 0 turns the feature off, nothing should ever notify.
+    #[test]
+    fn threshold_zero_disables_notifications() {
+        let s = NotificationState::new();
+        assert!(!s.should_notify_low_battery(0, 5, 0, false));
+        assert!(!s.should_notify_low_battery(1, 50, 0, false));
     }
 
     /// Cooldown expired: a fresh drop notifies again. Simulated by setting

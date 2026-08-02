@@ -1,17 +1,16 @@
 use ksni::{menu::StandardItem, Icon, MenuItem, OfflineReason, ToolTip, Tray};
-use log::{error, info, warn};
+use log::{info, warn};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 
+use crate::config;
+use crate::device::PollGate;
 use crate::tray::notifications::NotificationState;
 
 #[derive(Debug, Clone)]
 pub struct BatteryContext {
-    /// The current battery reading. `None` until the first successful poll
-    /// completes. Using Option avoids showing "0%" or a low-battery icon
-    /// in the window between service start and the first device read.
     pub battery: Option<(u8, bool)>, // (level, is_charging)
     pub notifications: NotificationState,
 }
@@ -28,191 +27,13 @@ impl Default for BatteryContext {
 pub struct BatteryTray {
     pub ctx: Arc<Mutex<BatteryContext>>,
     pub refresh_flag: Arc<AtomicBool>,
+    pub gate: Arc<PollGate>,
 }
 
 impl BatteryTray {
-    /// Spawn this binary with `--options` in a terminal emulator.
-    ///
-    /// Resolution order:
-    ///   1. `$TERMINAL`, explicit user preference, tried as-is.
-    ///   2. `$TERM` hint, several emulators set `$TERM` to a value that
-    ///      identifies their binary: alacritty->"alacritty", foot->"foot",
-    ///      kitty->"xterm-kitty", wezterm->"wezterm", ghostty->"xterm-ghostty".
-    ///      We map these to the correct binary and try before the generic list.
-    ///   3. Hard-coded fallback list, skipping anything already tried above.
-    fn launch_tui() {
-        let bin = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| "lightcrazy".to_string());
-
-        let args = ["--options"];
-
-        // 1. Explicit $TERMINAL
-        let explicit = std::env::var("TERMINAL").ok().filter(|s| !s.is_empty());
-        if let Some(ref term) = explicit {
-            if try_launch_in_terminal(term, &bin, &args) {
-                return;
-            }
-        }
-
-        // 2. Hint from $TERM.
-        //
-        // $TERM is normally a terminfo capability name ("xterm-256color" etc.),
-        // but several emulators set it to a value that unambiguously identifies
-        // their binary. Map only known, unambiguous values.
-        let term_hint = std::env::var("TERM").ok().and_then(|t| match t.as_str() {
-            "alacritty" => Some("alacritty"),
-            "foot" | "foot-extra" => Some("foot"),
-            "xterm-kitty" => Some("kitty"),
-            "wezterm" => Some("wezterm"),
-            "xterm-ghostty" | "ghostty" => Some("ghostty"),
-            _ => None,
-        });
-        if let Some(hint) = term_hint {
-            let already_tried = explicit.as_deref().is_some_and(|e| e == hint);
-            if !already_tried && try_launch_in_terminal(hint, &bin, &args) {
-                return;
-            }
-        }
-
-        // 3. Generic fallback list, skip anything already attempted above.
-        let fallbacks = [
-            "kitty",
-            "alacritty",
-            "wezterm",
-            "ghostty",
-            "foot",
-            "konsole",
-            "gnome-terminal",
-            "xterm",
-        ];
-        let already_tried: Vec<&str> = [explicit.as_deref(), term_hint]
-            .into_iter()
-            .flatten()
-            .collect();
-
-        for term in &fallbacks {
-            if already_tried.contains(term) {
-                continue;
-            }
-            if try_launch_in_terminal(term, &bin, &args) {
-                return;
-            }
-        }
-
-        // 4. Absolute-path probe for NixOS and other non-standard layouts.
-        //
-        // When the service's PATH doesn't include per-user profile directories
-        // (e.g. a systemd unit started before the shell profile is sourced),
-        // name-based lookup above will fail even though the binary is present.
-        // Probe the known NixOS profile paths directly by constructing
-        // absolute paths from the current user's name.
-        if let Some(abs) = find_terminal_in_nix_profiles(&already_tried) {
-            if try_launch_in_terminal(&abs, &bin, &args) {
-                return;
-            }
-        }
-
-        error!("No terminal emulator found. Set $TERMINAL or install kitty/alacritty/foot.");
-        NotificationState::send_notification(
-            "No Terminal Found",
-            "Set $TERMINAL or install kitty/alacritty/foot to open the control panel.",
-            "dialog-error",
-        );
-    }
-}
-
-/// Probe known NixOS profile bin directories for a terminal emulator.
-///
-/// Returns the absolute path of the first match found, or None.
-/// `skip` contains names already attempted via PATH-based lookup.
-fn find_terminal_in_nix_profiles(skip: &[&str]) -> Option<String> {
-    use std::path::PathBuf;
-
-    // Build candidate search dirs. The per-user profile path requires the
-    // username; fall back to $HOME-based path if USER is not set.
-    let user = std::env::var("USER").unwrap_or_default();
-    let home = std::env::var("HOME").unwrap_or_default();
-
-    let search_dirs: Vec<PathBuf> = [
-        format!("/etc/profiles/per-user/{}/bin", user),
-        format!("{}/.nix-profile/bin", home),
-        "/run/current-system/sw/bin".to_string(),
-        "/nix/var/nix/profiles/default/bin".to_string(),
-    ]
-    .into_iter()
-    .filter(|s| !s.is_empty())
-    .map(PathBuf::from)
-    .filter(|p| p.is_dir())
-    .collect();
-
-    let candidates = [
-        "alacritty",
-        "kitty",
-        "foot",
-        "wezterm",
-        "ghostty",
-        "konsole",
-        "gnome-terminal",
-        "xterm",
-    ];
-
-    for name in &candidates {
-        if skip.contains(name) {
-            continue;
-        }
-        for dir in &search_dirs {
-            let full = dir.join(name);
-            if full.is_file() {
-                let path = full.to_string_lossy().into_owned();
-                info!("Found terminal via NixOS profile path: {}", path);
-                return Some(path);
-            }
-        }
-    }
-
-    None
-}
-
-fn try_launch_in_terminal(terminal: &str, bin: &str, extra_args: &[&str]) -> bool {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    let (program, prefix): (&str, &[&str]) = match terminal {
-        "alacritty" => ("alacritty", &["--class", "lightcrazy,lightcrazy", "-e"]),
-        "kitty" => ("kitty", &["--class", "lightcrazy", "-e"]),
-        "foot" => ("foot", &["--app-id=lightcrazy"]),
-        "ghostty" => ("ghostty", &["--class=lightcrazy", "-e"]),
-        "wezterm" => ("wezterm", &["start", "--class", "lightcrazy", "--"]),
-        "konsole" => ("konsole", &["--name", "lightcrazy", "-e"]),
-        "gnome-terminal" => ("gnome-terminal", &["--class=lightcrazy", "--"]),
-        "xterm" => ("xterm", &["-class", "lightcrazy", "-e"]),
-        other => (other, &["-e"]),
-    };
-
-    let mut cmd = Command::new(program);
-    cmd.args(prefix).arg(bin).args(extra_args);
-
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-
-    match cmd.spawn() {
-        Ok(child) => {
-            info!("Launched {} {} in {}", bin, extra_args.join(" "), terminal);
-            std::thread::spawn(move || {
-                let mut child = child;
-                let _ = child.wait();
-            });
-            true
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            warn!("Failed to launch {} in {}: {}", bin, terminal, e);
-            false
-        }
+    fn open_configurator(&self) {
+        self.gate.pause_for(config::poll_pause_duration());
+        crate::browser::open_configurator();
     }
 }
 
@@ -230,13 +51,13 @@ impl Tray for BatteryTray {
     }
 
     fn id(&self) -> String {
-        "lightcrazy-battery".into()
+        "litecrazy-battery".into()
     }
 
     fn title(&self) -> String {
         let ctx = self.ctx.lock().unwrap();
         match ctx.battery {
-            Some((level, _)) => format!("Battery: {}%", level),
+            Some((level, _)) => format!("Battery: {level}%"),
             None => "Battery: reading...".to_string(),
         }
     }
@@ -245,7 +66,7 @@ impl Tray for BatteryTray {
         let ctx = self.ctx.lock().unwrap();
         let (title, description) = match ctx.battery {
             Some((level, charging)) => (
-                format!("Battery: {}%", level),
+                format!("Battery: {level}%"),
                 if charging { "Charging" } else { "Discharging" }.to_string(),
             ),
             None => (
@@ -263,17 +84,18 @@ impl Tray for BatteryTray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let ctx = self.ctx.lock().unwrap();
-        // NOTE: dbusmenu caches the menu layout for the lifetime of an open popup.
-        // The host re-queries icon_name() and tool_tip() immediately on change
-        // (via NewIcon/NewToolTip signals), but an already-open menu popup is a
-        // static snapshot, LayoutUpdated signals are ignored while it is visible.
-        // This means the battery label here will always reflect the state at the
-        // moment the user right-clicked. It will be correct on the next open.
         let battery_text = match ctx.battery {
             Some((level, charging)) => {
                 format!("Battery: {}%{}", level, if charging { " ⚡" } else { "" })
             }
             None => "Battery: reading...".to_string(),
+        };
+
+        let paused = self.gate.is_paused();
+        let pause_label = if paused {
+            "Resume battery polling"
+        } else {
+            "Pause battery polling"
         };
 
         vec![
@@ -285,10 +107,10 @@ impl Tray for BatteryTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Open Control Panel".into(),
-                icon_name: "utilities-terminal-symbolic".into(),
-                activate: Box::new(|_: &mut Self| {
-                    Self::launch_tui();
+                label: "Open Configurator".into(),
+                icon_name: "applications-internet".into(),
+                activate: Box::new(|this: &mut Self| {
+                    this.open_configurator();
                 }),
                 ..Default::default()
             }
@@ -297,12 +119,22 @@ impl Tray for BatteryTray {
                 label: "Refresh Now".into(),
                 icon_name: "view-refresh-symbolic".into(),
                 activate: Box::new(|this: &mut Self| {
-                    // Signal the battery worker to poll on its next tick.
-                    // The worker handles all the actual reading, we just
-                    // wake it. Release ordering pairs with the workers
-                    // AcqRel swap.
+                    this.gate.resume();
                     this.refresh_flag.store(true, Ordering::Release);
                     info!("Refresh requested via tray menu");
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: pause_label.into(),
+                icon_name: if paused {
+                    "media-playback-start-symbolic".into()
+                } else {
+                    "media-playback-pause-symbolic".into()
+                },
+                activate: Box::new(|this: &mut Self| {
+                    this.gate.toggle();
                 }),
                 ..Default::default()
             }

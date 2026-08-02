@@ -1,20 +1,45 @@
-# LIGHTCRAZY
+# LITECRAZY
 
-Linux control software for the Pulsar X2 CrazyLight.
+A battery tray icon for the Pulsar X2 CrazyLight on Linux.
 
-This project was created solely for personal use. But I figured I might aswell
-release it on the off-chance that someone else finds it useful!
+Device configuration now happens at **<https://bbb.pulsar.gg/>**, which talks to
+the mouse directly from the browser over WebHID. This project no longer
+duplicates that — the DPI/polling/LOD/debounce commands and the terminal UI are
+gone. What's left is the part a web page can't do: sit in the system tray, show
+the battery, and shout when it gets low.
 
 ## Features
 
-- DPI: 400 / 800 / 1600 / 3200 / 6400 / 12800
-- Polling rate: 125 – 8000 Hz
-- Lift-off distance: Low (0.7 mm), Medium (1 mm), High (2 mm)
-- Debounce time: 0 – 20 ms
-- Toggle: Angle Snap, Ripple Control, Motion Sync, Turbo Mode
-- Battery level and charging status via system tray
-- Low-battery desktop notifications (configurable threshold & alarm)
-- Terminal UI for settings (`--options`)
+- Battery level and charging status in the system tray
+- Low-battery desktop notification (configurable threshold)
+- Menu shortcut that opens the configurator in a Chromium-based browser
+- Automatically pauses polling while the configurator is open, so the tray and
+  the web page aren't driving the same HID node at once
+
+## Why Chromium
+
+The configurator uses WebHID. Firefox has declined to implement it and Safari
+has no plans, so in practice the page only works in a Chromium derivative.
+Handing the URL to `xdg-open` would silently do the wrong thing for anyone whose
+default browser is Firefox — the page loads, but the mouse never appears. So
+litecrazy looks for a Chromium binary itself, in this order:
+
+1. `$LITECRAZY_BROWSER`, if set
+2. `chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,
+   `brave-browser`, `brave`, `vivaldi-stable`, `vivaldi`,
+   `microsoft-edge-stable`, `microsoft-edge`, `thorium-browser`,
+   `ungoogled-chromium`, `opera`
+3. The same browsers packaged as Flatpaks
+4. `xdg-open`, plus a notification explaining why the page may not work
+
+The window is opened with `--app=` and `--class=litecrazy`, so it comes up
+chrome-less and can be given a compositor rule. Set `LITECRAZY_WINDOW_MODE=tab`
+if you'd rather have a normal tab.
+
+```
+# Hyprland
+windowrulev2 = float, class:^(litecrazy)$
+```
 
 ## Installation
 
@@ -22,18 +47,21 @@ release it on the off-chance that someone else finds it useful!
 
 ```nix
 # flake.nix
-inputs.lightcrazy = {
-  url = "github:cnsta/lightcrazy";
+inputs.litecrazy = {
+  url = "github:cnsta/litecrazy";
   inputs.nixpkgs.follows = "nixpkgs";
 };
 ```
 
 ```nix
 # configuration.nix
-hardware.lightcrazy = {
+hardware.litecrazy = {
   enable = true;        # installs package + udev rules
   service = {
     enable = true;      # systemd user service
+    browser = pkgs.chromium;   # optional; auto-detected when unset
+    batteryInterval = 60;
+    lowBatteryThreshold = 20;
   };
 };
 ```
@@ -50,16 +78,34 @@ package derivation.
 ## Usage
 
 ```bash
-lightcrazy            # start tray service (default)
-lightcrazy --options  # open settings panel (starts tray if not running)
+litecrazy          # start the tray (default)
+litecrazy --open   # open the configurator and exit — handy for a hotkey
+litecrazy --help
 ```
 
-Settings are stored in `~/.config/lightcrazy/settings.json` and applied to the
-device on startup.
+## Configuration
+
+There is no config file. The handful of remaining knobs are environment
+variables, which the NixOS module sets for you.
+
+| Variable                  | Default                  | Meaning                                                   |
+| ------------------------- | ------------------------ | --------------------------------------------------------- |
+| `LITECRAZY_URL`           | `https://bbb.pulsar.gg/` | Configurator URL                                          |
+| `LITECRAZY_BROWSER`       | _(auto-detect)_          | Browser binary, name or absolute path                     |
+| `LITECRAZY_BROWSER_ARGS`  | _(none)_                 | Extra flags for the browser                               |
+| `LITECRAZY_WINDOW_MODE`   | `app`                    | `app` for a chrome-less window, `tab` for an ordinary tab |
+| `LITECRAZY_INTERVAL`      | `60`                     | Battery poll interval, seconds (10–3600)                  |
+| `LITECRAZY_LOW_THRESHOLD` | `20`                     | Notification threshold, percent (0 = off)                 |
+| `LITECRAZY_PAUSE_MINUTES` | `10`                     | Polling pause after opening the configurator (0 = off)    |
+
+Polling backs off automatically while the mouse is asleep, up to 8× the base
+interval, so a low value is less costly than it looks.
 
 ## USB permissions
 
-On non-NixOS systems, create `/etc/udev/rules.d/99-lightcrazy.rules`:
+The same udev rules that let litecrazy read the battery are what let the browser
+reach the mouse from the configurator page. On non-NixOS systems, create
+`/etc/udev/rules.d/99-litecrazy.rules`:
 
 ```
 SUBSYSTEM=="usb",    ATTRS{idVendor}=="3710", ATTRS{idProduct}=="3414", MODE="0666", TAG+="uaccess"
@@ -81,10 +127,18 @@ have been thoroughly tested. Feel free to open an issue if you encounter bugs.
 
 **Tray not visible**: requires a StatusNotifier-compatible desktop (KDE, GNOME
 with AppIndicator extension, most others). Check
-`journalctl --user -u lightcrazy`.
+`journalctl --user -u litecrazy`.
 
-**Settings panel opens in wrong terminal**: set `TERMINAL` or `TERM` in your
-environment.
+**Configurator opens in Firefox**: no Chromium binary was found on `PATH`. Set
+`LITECRAZY_BROWSER` to the one you want, or `hardware.litecrazy.service.browser`
+on NixOS.
+
+**Configurator can't see the mouse**: check the udev rules above, and that the
+page is on HTTPS — WebHID is refused on insecure origins.
+
+**Battery reading goes stale**: polling pauses for ten minutes after you open
+the configurator. "Refresh Now" resumes it immediately, or set
+`LITECRAZY_PAUSE_MINUTES=0` to turn the behaviour off.
 
 ## Credits
 
