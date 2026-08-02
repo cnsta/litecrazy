@@ -2,11 +2,11 @@
 
 A battery tray icon for the Pulsar X2 CrazyLight on Linux.
 
-Device configuration now happens at **<https://bbb.pulsar.gg/>**, which talks to
-the mouse directly from the browser over WebHID. This project no longer
-duplicates that — the DPI/polling/LOD/debounce commands and the terminal UI are
-gone. What's left is the part a web page can't do: sit in the system tray, show
-the battery, and shout when it gets low.
+> [!NOTE]
+> Device configuration now happens at **<https://bbb.pulsar.gg/>**, which talks
+> to the mouse directly from the browser over WebHID. This is unfortunate but I
+> ran into far too many bugs and I simply don't have the time nor energy to
+> reverse engineer this piece of shit mouse.
 
 ## Features
 
@@ -16,13 +16,10 @@ the battery, and shout when it gets low.
 - Automatically pauses polling while the configurator is open, so the tray and
   the web page aren't driving the same HID node at once
 
-## Why Chromium
+> [!caution] Why Chromium? The configurator uses WebHID. Firefox has declined to
+> implement it, rightly citing security concerns. Use WebHID at your own risk.
 
-The configurator uses WebHID. Firefox has declined to implement it and Safari
-has no plans, so in practice the page only works in a Chromium derivative.
-Handing the URL to `xdg-open` would silently do the wrong thing for anyone whose
-default browser is Firefox — the page loads, but the mouse never appears. So
-litecrazy looks for a Chromium binary itself, in this order:
+The application looks for a Chromium binary in the following order:
 
 1. `$LITECRAZY_BROWSER`, if set
 2. `chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,
@@ -56,9 +53,9 @@ inputs.litecrazy = {
 ```nix
 # configuration.nix
 hardware.litecrazy = {
-  enable = true;        # installs package + udev rules
+  enable = true;               # installs package + udev rules
   service = {
-    enable = true;      # systemd user service
+    enable = true;             # systemd user service
     browser = pkgs.chromium;   # optional; auto-detected when unset
     batteryInterval = 60;
     lowBatteryThreshold = 20;
