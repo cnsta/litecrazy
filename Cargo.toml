@@ -1,6 +1,6 @@
 [package]
 name = "litecrazy"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 license = "MIT"
 authors = ["cnst <mail@cnst.dev>"]

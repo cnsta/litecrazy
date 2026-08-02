@@ -16,8 +16,9 @@ A battery tray icon for the Pulsar X2 CrazyLight on Linux.
 - Automatically pauses polling while the configurator is open, so the tray and
   the web page aren't driving the same HID node at once
 
-> [!caution] Why Chromium? The configurator uses WebHID. Firefox has declined to
-> implement it, rightly citing security concerns. Use WebHID at your own risk.
+> [!WARNING]
+> Why Chromium? The configurator uses WebHID. Firefox has declined to implement
+> it, rightly citing security concerns. Use WebHID at your own risk.
 
 The application looks for a Chromium binary in the following order:
 
