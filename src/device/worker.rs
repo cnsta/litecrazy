@@ -68,9 +68,14 @@ impl PollGate {
         info!("Battery polling paused");
     }
 
-    pub fn resume(&self) {
-        *self.state.lock().unwrap() = GateState::Running;
+    pub fn resume(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, GateState::Running) {
+            return false;
+        }
+        *state = GateState::Running;
         info!("Battery polling resumed");
+        true
     }
 
     pub fn toggle(&self) {

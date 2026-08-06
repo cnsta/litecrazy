@@ -2,35 +2,40 @@ use ksni::{menu::StandardItem, Icon, MenuItem, OfflineReason, ToolTip, Tray};
 use log::{info, warn};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use crate::config;
-use crate::device::PollGate;
-use crate::tray::notifications::NotificationState;
-
-#[derive(Debug, Clone)]
-pub struct BatteryContext {
-    pub battery: Option<(u8, bool)>, // (level, is_charging)
-    pub notifications: NotificationState,
-}
-
-impl Default for BatteryContext {
-    fn default() -> Self {
-        Self {
-            battery: None,
-            notifications: NotificationState::new(),
-        }
-    }
-}
+use crate::device::{MouseStatus, PollGate};
 
 pub struct BatteryTray {
-    pub ctx: Arc<Mutex<BatteryContext>>,
-    pub refresh_flag: Arc<AtomicBool>,
-    pub gate: Arc<PollGate>,
+    battery: Option<MouseStatus>,
+    refresh_flag: Arc<AtomicBool>,
+    gate: Arc<PollGate>,
 }
 
 impl BatteryTray {
+    pub fn new(refresh_flag: Arc<AtomicBool>, gate: Arc<PollGate>) -> Self {
+        Self {
+            battery: None,
+            refresh_flag,
+            gate,
+        }
+    }
+
+    pub fn set_battery(&mut self, status: MouseStatus) -> u8 {
+        let previous = self.battery.map_or(100, |s| s.battery_level);
+        self.battery = Some(status);
+        previous
+    }
+
+    fn battery_label(&self) -> String {
+        match self.battery {
+            Some(s) => format!("Battery: {}%", s.battery_level),
+            None => "Battery: reading...".to_string(),
+        }
+    }
+
     fn open_configurator(&self) {
         self.gate.pause_for(config::poll_pause_duration());
         crate::browser::open_configurator();
@@ -43,9 +48,8 @@ impl Tray for BatteryTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        let ctx = self.ctx.lock().unwrap();
-        match ctx.battery {
-            Some((level, charging)) => crate::tray::icon::get_pixmaps(level, charging),
+        match self.battery {
+            Some(s) => crate::tray::icon::get_pixmaps(s.battery_level, s.is_charging),
             None => crate::tray::icon::get_placeholder_pixmaps(),
         }
     }
@@ -55,48 +59,30 @@ impl Tray for BatteryTray {
     }
 
     fn title(&self) -> String {
-        let ctx = self.ctx.lock().unwrap();
-        match ctx.battery {
-            Some((level, _)) => format!("Battery: {level}%"),
-            None => "Battery: reading...".to_string(),
-        }
+        self.battery_label()
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let ctx = self.ctx.lock().unwrap();
-        let (title, description) = match ctx.battery {
-            Some((level, charging)) => (
-                format!("Battery: {level}%"),
-                if charging { "Charging" } else { "Discharging" }.to_string(),
-            ),
-            None => (
-                "Pulsar X2 CrazyLight".to_string(),
-                "Reading battery...".to_string(),
-            ),
-        };
         ToolTip {
-            title,
-            description,
-            icon_name: String::default(),
-            icon_pixmap: Vec::default(),
+            title: self.battery_label(),
+            description: match self.battery {
+                Some(s) if s.is_charging => "Charging".into(),
+                Some(_) => "Discharging".into(),
+                None => "Pulsar X2 CrazyLight".into(),
+            },
+            ..Default::default()
         }
     }
 
+    fn menu_about_to_show(&mut self) {}
+
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let ctx = self.ctx.lock().unwrap();
-        let battery_text = match ctx.battery {
-            Some((level, charging)) => {
-                format!("Battery: {}%{}", level, if charging { " ⚡" } else { "" })
-            }
-            None => "Battery: reading...".to_string(),
+        let battery_text = match self.battery {
+            Some(s) if s.is_charging => format!("{} ⚡", self.battery_label()),
+            _ => self.battery_label(),
         };
 
         let paused = self.gate.is_paused();
-        let pause_label = if paused {
-            "Resume battery polling"
-        } else {
-            "Pause battery polling"
-        };
 
         vec![
             StandardItem {
@@ -109,9 +95,7 @@ impl Tray for BatteryTray {
             StandardItem {
                 label: "Open Configurator".into(),
                 icon_name: "applications-internet".into(),
-                activate: Box::new(|this: &mut Self| {
-                    this.open_configurator();
-                }),
+                activate: Box::new(|this: &mut Self| this.open_configurator()),
                 ..Default::default()
             }
             .into(),
@@ -127,15 +111,17 @@ impl Tray for BatteryTray {
             }
             .into(),
             StandardItem {
-                label: pause_label.into(),
+                label: if paused {
+                    "Resume battery polling".into()
+                } else {
+                    "Pause battery polling".into()
+                },
                 icon_name: if paused {
                     "media-playback-start-symbolic".into()
                 } else {
                     "media-playback-pause-symbolic".into()
                 },
-                activate: Box::new(|this: &mut Self| {
-                    this.gate.toggle();
-                }),
+                activate: Box::new(|this: &mut Self| this.gate.toggle()),
                 ..Default::default()
             }
             .into(),

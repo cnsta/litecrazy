@@ -1,8 +1,8 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::RecvTimeoutError,
-        Arc, Mutex,
+        mpsc::{Receiver, RecvTimeoutError},
+        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -15,32 +15,15 @@ use log::{info, warn};
 use crate::{
     config,
     device::{BatteryEvent, BatteryWorker, MouseStatus, PollGate, WorkerConfig},
-    tray::menu::{BatteryContext, BatteryTray},
+    tray::{menu::BatteryTray, notifications::NotificationState},
 };
 
-/// How long to wait for the device to come back after a failed poll.
 const DISCONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
+const INITIAL_READING_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run() -> anyhow::Result<()> {
     info!("Starting litecrazy battery tray");
-
-    wait_for_watcher(Duration::from_secs(30));
-
-    let ctx = Arc::new(Mutex::new(BatteryContext::default()));
-    let refresh_flag = Arc::new(AtomicBool::new(false));
-    let gate = Arc::new(PollGate::new());
-
-    let tray = BatteryTray {
-        ctx: ctx.clone(),
-        refresh_flag: refresh_flag.clone(),
-        gate: gate.clone(),
-    };
-    let handle = tray
-        .assume_sni_available(true)
-        .spawn()
-        .context("Failed to spawn tray icon")?;
-
-    info!("Tray icon spawned successfully");
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -52,23 +35,53 @@ pub fn run() -> anyhow::Result<()> {
         .context("Failed to set signal handler")?;
     }
 
+    wait_for_watcher(Duration::from_secs(30));
+
+    let refresh_flag = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(PollGate::new());
+
     let interval = config::battery_interval();
     info!("Battery monitoring: checking every {}s", interval.as_secs());
 
     let (worker, events) = BatteryWorker::spawn(WorkerConfig {
         interval,
         disconnect_backoff: DISCONNECT_BACKOFF,
-        refresh_flag,
-        gate,
+        refresh_flag: refresh_flag.clone(),
+        gate: gate.clone(),
     });
     // Dropping the worker joins its thread, so it must outlive the loop.
     let _worker_guard = worker;
+
+    let mut notifications = NotificationState::new();
+    let mut tray = BatteryTray::new(refresh_flag, gate);
+
+    match wait_for_first_reading(&events, INITIAL_READING_TIMEOUT) {
+        Some(status) => {
+            info!(
+                "Initial battery: {}%{}",
+                status.battery_level,
+                if status.is_charging { " ⚡" } else { "" }
+            );
+            let previous = tray.set_battery(status);
+            maybe_notify(&mut notifications, status, previous);
+        }
+        None => info!("No reading yet; showing a placeholder until the mouse answers"),
+    }
+
+    let handle = tray
+        .assume_sni_available(true)
+        .spawn()
+        .context("Failed to spawn tray icon")?;
+
+    info!("Tray icon spawned successfully");
 
     while running.load(Ordering::Acquire) {
         // Short timeout so shutdown is responsive even when the worker is
         // idle. Like when the mouse has been asleep for hours.
         match events.recv_timeout(Duration::from_millis(500)) {
-            Ok(BatteryEvent::Update(status)) => handle_battery_update(&ctx, &handle, status),
+            Ok(BatteryEvent::Update(status)) => {
+                handle_battery_update(&handle, &mut notifications, status)
+            }
             Ok(BatteryEvent::Asleep) => log::debug!("Mouse asleep"),
             Ok(BatteryEvent::Disconnected) => {
                 info!("Device unreachable; waiting for it to come back")
@@ -83,6 +96,16 @@ pub fn run() -> anyhow::Result<()> {
 
     info!("Tray service shutting down");
     Ok(())
+}
+
+fn wait_for_first_reading(
+    events: &Receiver<BatteryEvent>,
+    timeout: Duration,
+) -> Option<MouseStatus> {
+    match events.recv_timeout(timeout) {
+        Ok(BatteryEvent::Update(status)) => Some(status),
+        _ => None,
+    }
 }
 
 fn wait_for_watcher(timeout: Duration) {
@@ -123,39 +146,35 @@ fn wait_for_watcher(timeout: Duration) {
     }
 }
 
-/// Apply a reading to the tray context and fire a notification if the
-/// low-battery threshold was crossed.
 fn handle_battery_update(
-    ctx: &Arc<Mutex<BatteryContext>>,
     handle: &ksni::blocking::Handle<BatteryTray>,
+    notifications: &mut NotificationState,
     status: MouseStatus,
 ) {
-    let threshold = config::low_battery_threshold();
-
     info!(
         "Battery: {}%{}",
         status.battery_level,
         if status.is_charging { " ⚡" } else { "" }
     );
 
-    let should_notify = {
-        let mut ctx_g = ctx.lock().unwrap();
-        let previous = ctx_g.battery.map(|(l, _)| l).unwrap_or(100);
-        ctx_g.battery = Some((status.battery_level, status.is_charging));
-        ctx_g.notifications.should_notify_low_battery(
-            status.battery_level,
-            previous,
-            threshold,
-            status.is_charging,
-        )
+    let Some(previous) = handle.update(|tray| tray.set_battery(status)) else {
+        warn!("Tray service is gone; battery update dropped");
+        return;
     };
 
-    if should_notify {
-        let mut ctx_g = ctx.lock().unwrap();
-        if let Err(e) = ctx_g.notifications.send_low_battery(status.battery_level) {
+    maybe_notify(notifications, status, previous);
+}
+
+fn maybe_notify(notifications: &mut NotificationState, status: MouseStatus, previous: u8) {
+    let threshold = config::low_battery_threshold();
+    if notifications.should_notify_low_battery(
+        status.battery_level,
+        previous,
+        threshold,
+        status.is_charging,
+    ) {
+        if let Err(e) = notifications.send_low_battery(status.battery_level) {
             warn!("Failed to send low-battery notification: {e}");
         }
     }
-
-    handle.update(|_| {});
 }
