@@ -1,11 +1,6 @@
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, RecvTimeoutError},
-        Arc,
-    },
-    thread,
-    time::{Duration, Instant},
+    sync::{Arc, mpsc::Receiver},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -14,7 +9,7 @@ use log::{info, warn};
 
 use crate::{
     config,
-    device::{BatteryEvent, BatteryWorker, MouseStatus, PollGate, WorkerConfig},
+    device::{BatteryEvent, BatteryWorker, Control, MouseStatus, PollGate, WorkerConfig},
     tray::{menu::BatteryTray, notifications::NotificationState},
 };
 
@@ -25,19 +20,6 @@ const INITIAL_READING_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn run() -> anyhow::Result<()> {
     info!("Starting litecrazy battery tray");
 
-    let running = Arc::new(AtomicBool::new(true));
-    {
-        let running = running.clone();
-        ctrlc::set_handler(move || {
-            info!("Received shutdown signal");
-            running.store(false, Ordering::Release);
-        })
-        .context("Failed to set signal handler")?;
-    }
-
-    wait_for_watcher(Duration::from_secs(30));
-
-    let refresh_flag = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(PollGate::new());
 
     let interval = config::battery_interval();
@@ -46,14 +28,21 @@ pub fn run() -> anyhow::Result<()> {
     let (worker, events) = BatteryWorker::spawn(WorkerConfig {
         interval,
         disconnect_backoff: DISCONNECT_BACKOFF,
-        refresh_flag: refresh_flag.clone(),
         gate: gate.clone(),
     });
-    // Dropping the worker joins its thread, so it must outlive the loop.
-    let _worker_guard = worker;
+
+    // Stopping the worker closes `events`, which ends the loop below.
+    {
+        let control = worker.control();
+        ctrlc::set_handler(move || {
+            info!("Received shutdown signal");
+            let _ = control.send(Control::Shutdown);
+        })
+        .context("Failed to set signal handler")?;
+    }
 
     let mut notifications = NotificationState::new();
-    let mut tray = BatteryTray::new(refresh_flag, gate);
+    let mut tray = BatteryTray::new(worker.control(), gate);
 
     match wait_for_first_reading(&events, INITIAL_READING_TIMEOUT) {
         Some(status) => {
@@ -68,6 +57,8 @@ pub fn run() -> anyhow::Result<()> {
         None => info!("No reading yet; showing a placeholder until the mouse answers"),
     }
 
+    // ksni registers with the StatusNotifierWatcher whenever one appears, so
+    // there's no need to wait for it here.
     let handle = tray
         .assume_sni_available(true)
         .spawn()
@@ -75,26 +66,20 @@ pub fn run() -> anyhow::Result<()> {
 
     info!("Tray icon spawned successfully");
 
-    while running.load(Ordering::Acquire) {
-        // Short timeout so shutdown is responsive even when the worker is
-        // idle. Like when the mouse has been asleep for hours.
-        match events.recv_timeout(Duration::from_millis(500)) {
-            Ok(BatteryEvent::Update(status)) => {
+    for event in &events {
+        match event {
+            BatteryEvent::Update(status) => {
                 handle_battery_update(&handle, &mut notifications, status)
             }
-            Ok(BatteryEvent::Asleep) => log::debug!("Mouse asleep"),
-            Ok(BatteryEvent::Disconnected) => {
+            BatteryEvent::Asleep => log::debug!("Mouse asleep"),
+            BatteryEvent::Disconnected => {
                 info!("Device unreachable; waiting for it to come back")
-            }
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                warn!("Battery worker channel closed; shutting down");
-                break;
             }
         }
     }
 
     info!("Tray service shutting down");
+    drop(worker);
     Ok(())
 }
 
@@ -105,44 +90,6 @@ fn wait_for_first_reading(
     match events.recv_timeout(timeout) {
         Ok(BatteryEvent::Update(status)) => Some(status),
         _ => None,
-    }
-}
-
-fn wait_for_watcher(timeout: Duration) {
-    use zbus::blocking::Connection;
-
-    let Ok(conn) = Connection::session() else {
-        warn!("Could not connect to session D-Bus; proceeding without watcher check");
-        return;
-    };
-    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&conn) else {
-        warn!("Could not create DBus proxy; proceeding without watcher check");
-        return;
-    };
-
-    let start = Instant::now();
-    loop {
-        match dbus.list_names() {
-            Ok(names)
-                if names
-                    .iter()
-                    .any(|n| n.as_str() == "org.kde.StatusNotifierWatcher") =>
-            {
-                info!("StatusNotifierWatcher is available");
-                return;
-            }
-            Ok(_) => {}
-            Err(e) => warn!("D-Bus list_names failed: {e}"),
-        }
-        if start.elapsed() >= timeout {
-            warn!(
-                "StatusNotifierWatcher not available after {}s — proceeding anyway; \
-                 ksni will re-register if it shows up later",
-                timeout.as_secs()
-            );
-            return;
-        }
-        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -172,9 +119,8 @@ fn maybe_notify(notifications: &mut NotificationState, status: MouseStatus, prev
         previous,
         threshold,
         status.is_charging,
-    ) {
-        if let Err(e) = notifications.send_low_battery(status.battery_level) {
-            warn!("Failed to send low-battery notification: {e}");
-        }
+    ) && let Err(e) = notifications.send_low_battery(status.battery_level)
+    {
+        warn!("Failed to send low-battery notification: {e}");
     }
 }
