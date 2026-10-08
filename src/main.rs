@@ -7,6 +7,7 @@ litecrazy — battery tray icon for the Pulsar X2 CrazyLight
 USAGE:
     litecrazy            Run the tray (default)
     litecrazy --open     Open the web configurator and exit
+    litecrazy --dump     Print the raw online/battery replies and exit
     litecrazy --help     Show this message
     litecrazy --version  Show the version
 
@@ -36,6 +37,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     init_logger();
+
+    if args.iter().any(|a| a == "--dump") {
+        return litecrazy::dump::run();
+    }
 
     if args.iter().any(|a| a == "--open" || a == "-o") {
         info!("Opening configurator at {}", config::configurator_url());
