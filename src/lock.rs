@@ -33,6 +33,7 @@ fn open_lock_file(name: &str) -> anyhow::Result<File> {
     let path = lock_path(name);
     std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
