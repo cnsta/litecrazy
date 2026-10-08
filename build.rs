@@ -7,7 +7,7 @@
 //! away at small sizes.
 
 use std::fmt::Write as FmtWrite;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Sizes to rasterize. 48 px is added for HiDPI panels; binary cost ~400 KB.
 const SIZES: &[u32] = &[16, 22, 32, 48];
@@ -40,59 +40,28 @@ fn main() {
                 format!("battery_{}", level)
             };
             let const_base = stem.to_uppercase();
-            let svg_path = icons_dir.join(format!("{}.svg", stem));
-
-            let svg_data = std::fs::read(&svg_path).unwrap_or_else(|e| {
-                panic!("build.rs: failed to read {}: {}", svg_path.display(), e)
-            });
-
-            let tree = {
-                let opts = resvg::usvg::Options::default();
-                resvg::usvg::Tree::from_data(&svg_data, &opts).unwrap_or_else(|e| {
-                    panic!("build.rs: failed to parse {}: {}", svg_path.display(), e)
-                })
-            };
-
+            let tree = load_svg(&icons_dir.join(format!("{stem}.svg")));
             for &size in SIZES {
-                let argb = rasterize(&tree, size);
-                let const_name = format!("{}_{}", const_base, size);
-                writeln!(
-                    out,
-                    "pub static {}: EmbeddedIcon = EmbeddedIcon {{\n\
-                     \x20   width: {},\n\
-                     \x20   height: {},\n\
-                     \x20   argb32: &{:?},\n\
-                     }};\n",
-                    const_name, size, size, argb
-                )
-                .unwrap();
+                emit_icon(
+                    &mut out,
+                    &out_dir,
+                    &format!("{const_base}_{size}"),
+                    &tree,
+                    size,
+                );
             }
         }
     }
 
-    {
-        let svg_path = icons_dir.join("placeholder.svg");
-        let svg_data = std::fs::read(&svg_path)
-            .unwrap_or_else(|e| panic!("build.rs: failed to read {}: {}", svg_path.display(), e));
-        let tree = {
-            let opts = resvg::usvg::Options::default();
-            resvg::usvg::Tree::from_data(&svg_data, &opts).unwrap_or_else(|e| {
-                panic!("build.rs: failed to parse {}: {}", svg_path.display(), e)
-            })
-        };
-        for &size in SIZES {
-            let argb = rasterize(&tree, size);
-            writeln!(
-                out,
-                "pub static PLACEHOLDER_{}: EmbeddedIcon = EmbeddedIcon {{\n\
-                 \x20   width: {},\n\
-                 \x20   height: {},\n\
-                 \x20   argb32: &{:?},\n\
-                 }};\n",
-                size, size, size, argb
-            )
-            .unwrap();
-        }
+    let tree = load_svg(&icons_dir.join("placeholder.svg"));
+    for &size in SIZES {
+        emit_icon(
+            &mut out,
+            &out_dir,
+            &format!("PLACEHOLDER_{size}"),
+            &tree,
+            size,
+        );
     }
 
     // Lookup function, level snapped to nearest 5%.
@@ -142,6 +111,28 @@ fn main() {
 
     std::fs::write(out_dir.join("icons_generated.rs"), out)
         .expect("build.rs: failed to write icons_generated.rs");
+}
+
+fn load_svg(path: &Path) -> resvg::usvg::Tree {
+    let data = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("build.rs: failed to read {}: {}", path.display(), e));
+    resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default())
+        .unwrap_or_else(|e| panic!("build.rs: failed to parse {}: {}", path.display(), e))
+}
+
+fn emit_icon(out: &mut String, out_dir: &Path, name: &str, tree: &resvg::usvg::Tree, size: u32) {
+    let file = format!("{name}.argb");
+    std::fs::write(out_dir.join(&file), rasterize(tree, size))
+        .unwrap_or_else(|e| panic!("build.rs: failed to write {file}: {e}"));
+    writeln!(
+        out,
+        "pub static {name}: EmbeddedIcon = EmbeddedIcon {{\n\
+         \x20   width: {size},\n\
+         \x20   height: {size},\n\
+         \x20   argb32: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\")),\n\
+         }};\n"
+    )
+    .unwrap();
 }
 
 /// Render an SVG to a pixel array at `target_size`.

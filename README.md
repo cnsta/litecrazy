@@ -10,7 +10,7 @@ A battery tray icon for the Pulsar X2 CrazyLight on Linux.
 
 ## Features
 
-- Battery level and charging status in the system tray
+- Battery level, charging status and cell voltage in the system tray
 - Low-battery desktop notification (configurable threshold)
 - Menu shortcut that opens the configurator in a Chromium-based browser
 - Automatically pauses polling while the configurator is open, so the tray and
@@ -78,6 +78,7 @@ package derivation.
 ```bash
 litecrazy          # start the tray (default)
 litecrazy --open   # open the configurator and exit — handy for a hotkey
+litecrazy --dump   # print the raw online/battery replies (for bug reports)
 litecrazy --help
 ```
 
