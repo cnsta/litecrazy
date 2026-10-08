@@ -1,24 +1,21 @@
 use ksni::{menu::StandardItem, Icon, MenuItem, OfflineReason, ToolTip, Tray};
 use log::{info, warn};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::{mpsc::Sender, Arc};
 
 use crate::config;
-use crate::device::{MouseStatus, PollGate};
+use crate::device::{Control, MouseStatus, PollGate};
 
 pub struct BatteryTray {
     battery: Option<MouseStatus>,
-    refresh_flag: Arc<AtomicBool>,
+    control: Sender<Control>,
     gate: Arc<PollGate>,
 }
 
 impl BatteryTray {
-    pub fn new(refresh_flag: Arc<AtomicBool>, gate: Arc<PollGate>) -> Self {
+    pub fn new(control: Sender<Control>, gate: Arc<PollGate>) -> Self {
         Self {
             battery: None,
-            refresh_flag,
+            control,
             gate,
         }
     }
@@ -36,10 +33,32 @@ impl BatteryTray {
         }
     }
 
+    /// "Charging" or "Discharging", plus the cell voltage when known.
+    fn state_label(s: MouseStatus) -> String {
+        let state = if s.is_charging {
+            "Charging"
+        } else {
+            "Discharging"
+        };
+        match s.voltage_mv {
+            Some(mv) => format!("{state} \u{b7} {}", volts(mv)),
+            None => state.into(),
+        }
+    }
+
+    fn wake_worker(&self, msg: Control) {
+        let _ = self.control.send(msg);
+    }
+
     fn open_configurator(&self) {
         self.gate.pause_for(config::poll_pause_duration());
+        self.wake_worker(Control::GateChanged);
         crate::browser::open_configurator();
     }
+}
+
+fn volts(mv: u16) -> String {
+    format!("{:.2} V", f32::from(mv) / 1000.0)
 }
 
 impl Tray for BatteryTray {
@@ -66,8 +85,7 @@ impl Tray for BatteryTray {
         ToolTip {
             title: self.battery_label(),
             description: match self.battery {
-                Some(s) if s.is_charging => "Charging".into(),
-                Some(_) => "Discharging".into(),
+                Some(s) => Self::state_label(s),
                 None => "Pulsar X2 CrazyLight".into(),
             },
             ..Default::default()
@@ -77,10 +95,15 @@ impl Tray for BatteryTray {
     fn menu_about_to_show(&mut self) {}
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let battery_text = match self.battery {
-            Some(s) if s.is_charging => format!("{} ⚡", self.battery_label()),
-            _ => self.battery_label(),
-        };
+        let mut battery_text = self.battery_label();
+        if let Some(s) = self.battery {
+            if let Some(mv) = s.voltage_mv {
+                battery_text += &format!(" \u{b7} {}", volts(mv));
+            }
+            if s.is_charging {
+                battery_text += " ⚡";
+            }
+        }
 
         let paused = self.gate.is_paused();
 
@@ -104,7 +127,7 @@ impl Tray for BatteryTray {
                 icon_name: "view-refresh-symbolic".into(),
                 activate: Box::new(|this: &mut Self| {
                     this.gate.resume();
-                    this.refresh_flag.store(true, Ordering::Release);
+                    this.wake_worker(Control::Refresh);
                     info!("Refresh requested via tray menu");
                 }),
                 ..Default::default()
@@ -121,7 +144,10 @@ impl Tray for BatteryTray {
                 } else {
                     "media-playback-pause-symbolic".into()
                 },
-                activate: Box::new(|this: &mut Self| this.gate.toggle()),
+                activate: Box::new(|this: &mut Self| {
+                    this.gate.toggle();
+                    this.wake_worker(Control::GateChanged);
+                }),
                 ..Default::default()
             }
             .into(),
