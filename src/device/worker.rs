@@ -1,14 +1,14 @@
 use log::{debug, info, warn};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    Arc, Mutex,
+    mpsc::{self, RecvTimeoutError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::device::{
     protocol::{self, BatteryReadError, MouseStatus},
-    transport::Device,
+    transport::Locator,
 };
 
 #[derive(Debug, Clone)]
@@ -16,6 +16,13 @@ pub enum BatteryEvent {
     Update(MouseStatus),
     Asleep,
     Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Refresh,
+    GateChanged,
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,15 +50,20 @@ impl PollGate {
         Self::default()
     }
 
-    pub fn is_paused(&self) -> bool {
+    /// The current state, expiring a timed pause whose deadline has passed.
+    fn current(&self) -> GateState {
         let mut state = self.state.lock().unwrap();
-        if let GateState::PausedUntil(deadline) = *state {
-            if Instant::now() >= deadline {
-                info!("Poll pause expired; resuming battery polling");
-                *state = GateState::Running;
-            }
+        if let GateState::PausedUntil(deadline) = *state
+            && Instant::now() >= deadline
+        {
+            info!("Poll pause expired; resuming battery polling");
+            *state = GateState::Running;
         }
-        !matches!(*state, GateState::Running)
+        *state
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.current() != GateState::Running
     }
 
     pub fn pause_for(&self, duration: Duration) {
@@ -90,19 +102,18 @@ impl PollGate {
 pub struct WorkerConfig {
     pub interval: Duration,
     pub disconnect_backoff: Duration,
-    pub refresh_flag: Arc<AtomicBool>,
     pub gate: Arc<PollGate>,
 }
 
-/// Handle to the background worker. Dropping joins the thread.
+/// Handle to the background worker. Dropping stops and joins the thread.
 pub struct BatteryWorker {
-    running: Arc<AtomicBool>,
+    control: mpsc::Sender<Control>,
     join: Option<JoinHandle<()>>,
 }
 
 impl Drop for BatteryWorker {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
+        let _ = self.control.send(Control::Shutdown);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -111,21 +122,26 @@ impl Drop for BatteryWorker {
 
 impl BatteryWorker {
     /// Spawn the worker thread. Returns the handle (drop to stop) and the
-    /// receiving end of the event channel.
+    /// receiving end of the event channel, which closes when the worker
+    /// stops.
     pub fn spawn(config: WorkerConfig) -> (Self, mpsc::Receiver<BatteryEvent>) {
         let (tx, rx) = mpsc::channel();
-        let running = Arc::new(AtomicBool::new(true));
-        let running_clone = running.clone();
+        let (control, control_rx) = mpsc::channel();
 
-        let join = thread::spawn(move || worker_loop(config, running_clone, tx));
+        let join = thread::spawn(move || worker_loop(config, control_rx, tx));
 
         (
             Self {
-                running,
+                control,
                 join: Some(join),
             },
             rx,
         )
+    }
+
+    /// A sender for waking or stopping the worker.
+    pub fn control(&self) -> mpsc::Sender<Control> {
+        self.control.clone()
     }
 }
 
@@ -137,21 +153,43 @@ enum PollOutcome {
     Disconnected,
 }
 
-fn poll_once() -> PollOutcome {
-    let device = match Device::open() {
-        Ok(d) => d,
-        Err(e) => {
-            debug!("Device::open failed: {e}");
-            return PollOutcome::Disconnected;
-        }
-    };
+/// Device lookup state that survives between polls. The node itself is
+/// opened per poll and closed again, so the kernel isn't queueing this
+/// interface's reports for us in between.
+struct Session {
+    locator: Option<Locator>,
+    handshaken: bool,
+}
 
-    match protocol::get_mouse_battery(&device) {
-        Ok(status) => PollOutcome::Ok(status),
-        Err(BatteryReadError::Asleep) => PollOutcome::Asleep,
-        Err(BatteryReadError::Io(e)) => {
-            info!("Transport error: {e}");
-            PollOutcome::Disconnected
+impl Session {
+    fn poll(&mut self) -> PollOutcome {
+        let locator = match &mut self.locator {
+            Some(l) => l,
+            None => match Locator::new() {
+                Ok(l) => self.locator.insert(l),
+                Err(e) => {
+                    debug!("HID init failed: {e}");
+                    return PollOutcome::Disconnected;
+                }
+            },
+        };
+        let device = match locator.open() {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("Device open failed: {e}");
+                self.handshaken = false;
+                return PollOutcome::Disconnected;
+            }
+        };
+
+        match protocol::get_mouse_battery(&device, &mut self.handshaken) {
+            Ok(status) => PollOutcome::Ok(status),
+            Err(BatteryReadError::Asleep) => PollOutcome::Asleep,
+            Err(BatteryReadError::Io(e)) => {
+                info!("Transport error: {e}");
+                self.handshaken = false;
+                PollOutcome::Disconnected
+            }
         }
     }
 }
@@ -166,11 +204,24 @@ fn next_sleep_interval(base: Duration, consecutive_asleep: u32) -> Duration {
     base.saturating_mul(multiplier)
 }
 
-fn worker_loop(config: WorkerConfig, running: Arc<AtomicBool>, tx: mpsc::Sender<BatteryEvent>) {
+/// When the worker must wake on its own: the next poll while running, the
+/// end of a timed pause, or never (only a `Control` message wakes it).
+fn wake_deadline(gate: GateState, next_poll: Instant) -> Option<Instant> {
+    match gate {
+        GateState::Running => Some(next_poll),
+        GateState::PausedUntil(t) => Some(t),
+        GateState::Paused => None,
+    }
+}
+
+fn worker_loop(
+    config: WorkerConfig,
+    control: mpsc::Receiver<Control>,
+    tx: mpsc::Sender<BatteryEvent>,
+) {
     let WorkerConfig {
         interval,
         disconnect_backoff,
-        refresh_flag,
         gate,
     } = config;
 
@@ -180,74 +231,69 @@ fn worker_loop(config: WorkerConfig, running: Arc<AtomicBool>, tx: mpsc::Sender<
         disconnect_backoff.as_secs(),
     );
 
-    const TICK: Duration = Duration::from_millis(200);
-
-    let mut accumulated = Duration::ZERO;
-    let mut backoff_remaining = Duration::ZERO;
+    let mut session = Session {
+        locator: None,
+        handshaken: false,
+    };
     let mut consecutive_asleep: u32 = 0;
-    let mut current_interval = interval;
-    let mut first_poll_pending = true;
+    let mut next_poll = Instant::now();
     let mut was_paused = false;
 
-    while running.load(Ordering::Acquire) {
-        thread::sleep(TICK);
-
-        let manual_refresh = refresh_flag.swap(false, Ordering::AcqRel);
-
-        if gate.is_paused() {
-            was_paused = true;
-            continue;
-        }
-
-        // Poll immediately on the first tick after a pause, so resuming from
-        // the menu gives an instant reading rather than a stale one.
-        let just_resumed = was_paused;
-        was_paused = false;
-
-        if manual_refresh || just_resumed {
-            backoff_remaining = Duration::ZERO;
-        } else if backoff_remaining > Duration::ZERO {
-            backoff_remaining = backoff_remaining.saturating_sub(TICK);
-            continue;
-        } else {
-            accumulated += TICK;
-            if !first_poll_pending && accumulated < current_interval {
+    loop {
+        let state = gate.current();
+        if state == GateState::Running {
+            // Poll immediately after a pause, so resuming from the menu
+            // gives an instant reading rather than a stale one.
+            if was_paused {
+                was_paused = false;
+                next_poll = Instant::now();
+            }
+            if Instant::now() >= next_poll {
+                let delay = match session.poll() {
+                    PollOutcome::Ok(status) => {
+                        if consecutive_asleep > 0 {
+                            debug!("Mouse awake after {consecutive_asleep} asleep poll(s)");
+                        }
+                        consecutive_asleep = 0;
+                        let _ = tx.send(BatteryEvent::Update(status));
+                        interval
+                    }
+                    PollOutcome::Asleep => {
+                        consecutive_asleep = consecutive_asleep.saturating_add(1);
+                        let delay = next_sleep_interval(interval, consecutive_asleep);
+                        debug!(
+                            "Mouse asleep (consecutive: {}, next poll in {}s)",
+                            consecutive_asleep,
+                            delay.as_secs()
+                        );
+                        let _ = tx.send(BatteryEvent::Asleep);
+                        delay
+                    }
+                    PollOutcome::Disconnected => {
+                        consecutive_asleep = 0;
+                        warn!(
+                            "Device unreachable, backing off {}s",
+                            disconnect_backoff.as_secs()
+                        );
+                        let _ = tx.send(BatteryEvent::Disconnected);
+                        disconnect_backoff
+                    }
+                };
+                next_poll = Instant::now() + delay;
                 continue;
             }
+        } else {
+            was_paused = true;
         }
 
-        accumulated = Duration::ZERO;
-        first_poll_pending = false;
-
-        match poll_once() {
-            PollOutcome::Ok(status) => {
-                if consecutive_asleep > 0 {
-                    debug!("Mouse awake after {consecutive_asleep} asleep poll(s)");
-                }
-                consecutive_asleep = 0;
-                current_interval = interval;
-                let _ = tx.send(BatteryEvent::Update(status));
-            }
-            PollOutcome::Asleep => {
-                consecutive_asleep = consecutive_asleep.saturating_add(1);
-                current_interval = next_sleep_interval(interval, consecutive_asleep);
-                debug!(
-                    "Mouse asleep (consecutive: {}, next poll in {}s)",
-                    consecutive_asleep,
-                    current_interval.as_secs()
-                );
-                let _ = tx.send(BatteryEvent::Asleep);
-            }
-            PollOutcome::Disconnected => {
-                consecutive_asleep = 0;
-                current_interval = interval;
-                backoff_remaining = disconnect_backoff;
-                warn!(
-                    "Device unreachable, backing off {}s",
-                    disconnect_backoff.as_secs()
-                );
-                let _ = tx.send(BatteryEvent::Disconnected);
-            }
+        let msg = match wake_deadline(state, next_poll) {
+            Some(t) => control.recv_timeout(t.saturating_duration_since(Instant::now())),
+            None => control.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match msg {
+            Ok(Control::Refresh) => next_poll = Instant::now(),
+            Ok(Control::GateChanged) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Control::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -307,6 +353,18 @@ mod tests {
         let gate = PollGate::new();
         gate.pause_for(Duration::ZERO);
         assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn wake_deadline_follows_the_gate() {
+        let poll = Instant::now() + Duration::from_secs(60);
+        let pause_end = Instant::now() + Duration::from_secs(600);
+        assert_eq!(wake_deadline(GateState::Running, poll), Some(poll));
+        assert_eq!(
+            wake_deadline(GateState::PausedUntil(pause_end), poll),
+            Some(pause_end)
+        );
+        assert_eq!(wake_deadline(GateState::Paused, poll), None);
     }
 
     #[test]
