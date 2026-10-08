@@ -42,19 +42,19 @@ fn extra_search_dirs() -> Vec<PathBuf> {
 
     // Only build the user-specific paths when we actually know the user;
     // an empty $USER would otherwise produce "/etc/profiles/per-user//bin".
-    if let Ok(user) = std::env::var("USER") {
-        if !user.is_empty() {
-            dirs.push(PathBuf::from(format!("/etc/profiles/per-user/{user}/bin")));
-        }
+    if let Ok(user) = std::env::var("USER")
+        && !user.is_empty()
+    {
+        dirs.push(PathBuf::from(format!("/etc/profiles/per-user/{user}/bin")));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            dirs.push(PathBuf::from(format!("{home}/.nix-profile/bin")));
-            dirs.push(PathBuf::from(format!("{home}/.local/bin")));
-            dirs.push(PathBuf::from(format!(
-                "{home}/.local/share/flatpak/exports/bin"
-            )));
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        dirs.push(PathBuf::from(format!("{home}/.nix-profile/bin")));
+        dirs.push(PathBuf::from(format!("{home}/.local/bin")));
+        dirs.push(PathBuf::from(format!(
+            "{home}/.local/share/flatpak/exports/bin"
+        )));
     }
 
     dirs.retain(|p| p.is_dir());
