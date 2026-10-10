@@ -23,12 +23,14 @@ A battery tray icon for the Pulsar X2 CrazyLight on Linux.
 The application looks for a Chromium binary in the following order:
 
 1. `$LITECRAZY_BROWSER`, if set
-2. `chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,
+2. The desktop's default browser (`xdg-settings get default-web-browser`), if it
+   is one of the Chromium browsers below
+3. `chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,
    `brave-browser`, `brave`, `vivaldi-stable`, `vivaldi`,
    `microsoft-edge-stable`, `microsoft-edge`, `thorium-browser`,
    `ungoogled-chromium`, `opera`
-3. The same browsers packaged as Flatpaks
-4. `xdg-open`, plus a notification explaining why the page may not work
+4. The same browsers packaged as Flatpaks
+5. `xdg-open`, plus a notification explaining why the page may not work
 
 The window is opened with `--app=` and `--class=litecrazy`, so it comes up
 chrome-less and can be given a compositor rule. Set `LITECRAZY_WINDOW_MODE=tab`

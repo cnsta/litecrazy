@@ -123,6 +123,10 @@ fn resolve_launcher() -> Launcher {
         }
     }
 
+    if let Some(launcher) = default_browser() {
+        return launcher;
+    }
+
     for &name in CHROMIUM_BINARIES {
         if let Some(path) = find_executable(name) {
             info!("Found Chromium-based browser: {}", path.display());
@@ -140,6 +144,95 @@ fn resolve_launcher() -> Launcher {
     }
 
     Launcher::Fallback
+}
+
+/// The desktop's default browser, if it is Chromium-based. A Firefox-based
+/// default can't run the configurator (no WebHID), so it's skipped.
+fn default_browser() -> Option<Launcher> {
+    let desktop_id = default_desktop_id()?;
+    let stem = desktop_id.strip_suffix(".desktop").unwrap_or(&desktop_id);
+
+    if let Some(&app) = FLATPAK_APPS.iter().find(|&&app| app == stem)
+        && flatpak_installed(app)
+    {
+        info!("Using default browser (Flatpak): {app}");
+        return Some(Launcher::Flatpak(app));
+    }
+
+    let program = find_desktop_file(&desktop_id)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|contents| exec_program(&contents));
+    if let Some(path) = program
+        .filter(|p| is_chromium_name(p))
+        .and_then(|p| find_executable(&p))
+    {
+        info!("Using default browser {desktop_id}: {}", path.display());
+        return Some(Launcher::Chromium(path));
+    }
+
+    info!("Default browser {desktop_id} isn't Chromium-based (no WebHID); auto-detecting");
+    None
+}
+
+/// The default browser's desktop file ID (`chromium.desktop`), as reported
+/// by xdg-utils.
+fn default_desktop_id() -> Option<String> {
+    let query = |program: &str, args: &[&str]| {
+        let out = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let id = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (out.status.success() && id.ends_with(".desktop")).then_some(id)
+    };
+    query("xdg-settings", &["get", "default-web-browser"])
+        .or_else(|| query("xdg-mime", &["query", "default", "x-scheme-handler/https"]))
+}
+
+/// Look `desktop_id` up in the XDG application directories.
+fn find_desktop_file(desktop_id: &str) -> Option<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+
+    data_home
+        .into_iter()
+        .chain(std::env::split_paths(&data_dirs))
+        .map(|dir| dir.join("applications").join(desktop_id))
+        .find(|path| path.is_file())
+}
+
+/// The program of the `[Desktop Entry]` group's `Exec=` line, skipping an
+/// `env VAR=value …` prefix.
+fn exec_program(desktop_file: &str) -> Option<String> {
+    let mut in_entry = false;
+    for line in desktop_file.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+        } else if in_entry && let Some(exec) = line.strip_prefix("Exec=") {
+            return exec
+                .split_whitespace()
+                .map(|token| token.trim_matches('"'))
+                .skip_while(|&token| token == "env" || token.ends_with("/env"))
+                .find(|token| !token.contains('='))
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
+fn is_chromium_name(program: &str) -> bool {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    CHROMIUM_BINARIES.contains(&name)
 }
 
 /// Last resort: let the desktop decide, and tell the user why that might
@@ -263,6 +356,32 @@ mod tests {
             vec!["--ozone-platform=wayland".into()],
         );
         assert_eq!(args.last().unwrap(), "--ozone-platform=wayland");
+    }
+
+    #[test]
+    fn exec_program_reads_the_desktop_entry() {
+        let file = "[Desktop Entry]\nName=Chromium\nExec=/nix/store/x/bin/chromium %U\n\
+                    [Desktop Action new-window]\nExec=other --new-window\n";
+        assert_eq!(
+            exec_program(file).as_deref(),
+            Some("/nix/store/x/bin/chromium")
+        );
+    }
+
+    #[test]
+    fn exec_program_ignores_actions_and_env() {
+        let file = "[Desktop Action x]\nExec=wrong\n[Desktop Entry]\n\
+                    Exec=env GDK_BACKEND=wayland \"brave\" %U\n";
+        assert_eq!(exec_program(file).as_deref(), Some("brave"));
+        assert_eq!(exec_program("[Desktop Entry]\nName=x\n"), None);
+    }
+
+    #[test]
+    fn chromium_names_match_by_basename() {
+        assert!(is_chromium_name("/nix/store/x/bin/google-chrome-stable"));
+        assert!(is_chromium_name("brave"));
+        assert!(!is_chromium_name("/nix/store/x/bin/zen"));
+        assert!(!is_chromium_name("firefox"));
     }
 
     #[test]
