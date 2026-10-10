@@ -9,6 +9,7 @@ pub struct BatteryTray {
     battery: Option<MouseStatus>,
     control: Sender<Control>,
     gate: Arc<PollGate>,
+    layout_flip: bool,
 }
 
 impl BatteryTray {
@@ -17,11 +18,15 @@ impl BatteryTray {
             battery: None,
             control,
             gate,
+            layout_flip: false,
         }
     }
 
     pub fn set_battery(&mut self, status: MouseStatus) -> u8 {
         let previous = self.battery.map_or(100, |s| s.battery_level);
+        if self.battery != Some(status) {
+            self.layout_flip = !self.layout_flip;
+        }
         self.battery = Some(status);
         previous
     }
@@ -107,7 +112,7 @@ impl Tray for BatteryTray {
 
         let paused = self.gate.is_paused();
 
-        vec![
+        let mut items = vec![
             StandardItem {
                 label: battery_text,
                 enabled: false,
@@ -116,14 +121,14 @@ impl Tray for BatteryTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Open Configurator".into(),
+                label: "Open configurator".into(),
                 icon_name: "applications-internet".into(),
                 activate: Box::new(|this: &mut Self| this.open_configurator()),
                 ..Default::default()
             }
             .into(),
             StandardItem {
-                label: "Refresh Now".into(),
+                label: "Refresh now".into(),
                 icon_name: "view-refresh-symbolic".into(),
                 activate: Box::new(|this: &mut Self| {
                     this.gate.resume();
@@ -162,7 +167,19 @@ impl Tray for BatteryTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ];
+
+        if self.layout_flip {
+            items.push(
+                StandardItem {
+                    visible: false,
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items
     }
 
     fn watcher_online(&self) {
@@ -172,5 +189,40 @@ impl Tray for BatteryTray {
     fn watcher_offline(&self, _reason: OfflineReason) -> bool {
         warn!("Tray watcher offline; keeping service alive, ksni will re-register");
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tray() -> BatteryTray {
+        BatteryTray::new(std::sync::mpsc::channel().0, Arc::new(PollGate::new()))
+    }
+
+    fn status(level: u8) -> MouseStatus {
+        MouseStatus {
+            battery_level: level,
+            is_charging: false,
+            voltage_mv: Some(4100),
+        }
+    }
+
+    #[test]
+    fn status_change_changes_the_layout() {
+        let mut t = tray();
+        t.set_battery(status(100));
+        let before = t.menu().len();
+        t.set_battery(status(95));
+        assert_ne!(t.menu().len(), before);
+    }
+
+    #[test]
+    fn same_status_keeps_the_layout() {
+        let mut t = tray();
+        t.set_battery(status(100));
+        let before = t.menu().len();
+        t.set_battery(status(100));
+        assert_eq!(t.menu().len(), before);
     }
 }
